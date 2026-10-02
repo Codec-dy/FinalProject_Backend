@@ -60,6 +60,7 @@ class TelemetryInfo(BaseModel):
     control_module_voltage: float | None = None
     short_trim: float | None = None
     hybrid_battery_life: float | None = None
+    timestamp: datetime.datetime | None = None
 
 
 try:
@@ -203,7 +204,8 @@ def add_telemetry_data(telemetry: list[TelemetryInfo], db: Session = Depends(get
                 timing_advance=data.timing_advance,
                 control_module_voltage=data.control_module_voltage,
                 short_trim=data.short_trim,
-                hybrid_battery_life=data.hybrid_battery_life
+                hybrid_battery_life=data.hybrid_battery_life,
+                timestamp=data.timestamp
             )
             db.add(telemetry_data)
             telemetry_records.append(telemetry_data)
@@ -257,11 +259,11 @@ def get_telemetry_data(vehicle_id: str, db: Session = Depends(get_db)):
         raise e
 
 @app.post("/api/driving_sessions/start")
-def start_driving_session(vehicle_id: str, db: Session = Depends(get_db)):
+def start_driving_session(vehicle_id: str, start_time: datetime.datetime = None, db: Session = Depends(get_db)):
     try:
         driving_session = DrivingSession(
             vehicle_id=UUID(vehicle_id),
-            start_time=datetime.datetime.utcnow()
+            start_time=start_time
         )
         db.add(driving_session)
         db.flush()
@@ -277,13 +279,13 @@ def start_driving_session(vehicle_id: str, db: Session = Depends(get_db)):
         raise e
 
 @app.put("/api/driving_sessions/end")
-def end_driving_session(driving_session_id: str, db: Session = Depends(get_db)):
+def end_driving_session(driving_session_id: str, end_time: datetime.datetime = None, db: Session = Depends(get_db)):
     try:
         driving_session = db.query(DrivingSession).filter(DrivingSession.id == UUID(driving_session_id)).first()
         if not driving_session:
             return {"message": "Driving session not found", "success": False}
         
-        driving_session.end_time = datetime.datetime.utcnow()
+        driving_session.end_time = end_time or datetime.datetime.now()
         db.commit()
         db.refresh(driving_session)
         return {
