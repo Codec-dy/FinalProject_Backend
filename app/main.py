@@ -290,7 +290,9 @@ def end_driving_session(driving_session_id: str, end_time: datetime.datetime = N
         if not driving_session:
             return {"message": "Driving session not found", "success": False}
         
-        driving_session.end_time = end_time or datetime.datetime.now()
+        driving_session.end_time = end_time or datetime.datetime.now(
+            datetime.timezone.utc
+        )
         db.commit()
         db.refresh(driving_session)
         return {
@@ -425,4 +427,3 @@ def signup(signup: Signup, db: Session = Depends(get_db)):
         db.rollback()
         raise e
         # raise e
-
