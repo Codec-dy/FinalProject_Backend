@@ -1,10 +1,15 @@
 import datetime
+import json
+from typing import Any
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 from pydantic import BaseModel
 from uuid import UUID
 from sqlalchemy.orm import Session
+
+from .services.summaryCalc import build_session_summary
 
 from .models.driving_session import DrivingSession
 from .models.user import User
@@ -351,7 +356,37 @@ def add_diagnostics_info(info: DiagnosticsInfo, db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         raise e
-    
+
+
+
+#SummaryRoute
+@app.get('/api/summary')
+def create_session_summary(drivingSession, db: Session = Depends(get_db)):
+    try:
+        summary = build_session_summary(
+            db=db,
+            driving_session_id=drivingSession
+        )
+
+        return {
+            "id": str(summary.id),
+            "driving_session_id": str(summary.driving_session_id),
+            "vehicle_id":str(summary.vehicle_id),
+            "duration_seconds": summary.duration_seconds,
+            "distance": summary.distance,
+            "average_speed": summary.average_speed,
+            "average_moving_speed": summary.average_moving_speed,
+            "maximum_speed": summary.maximum_speed,
+            "total_samples": summary.total_samples,
+            "telemetry_summary": summary.telemetry_summary,
+            "data_quality": summary.data_quality,
+        }
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc)
+        )
 
 # Signup endpoint
 @app.post("/api/signup")
@@ -391,16 +426,3 @@ def signup(signup: Signup, db: Session = Depends(get_db)):
         raise e
         # raise e
 
-
-
-# @app.get("/")
-# async def root():
-#     return {"message": "Hello World"}
-
-# @app.get("/items/{item_id}")
-# async def read_item(item_id: int, q: str = None):
-#     return {"item_id": item_id, "q": q}
-
-# @app.post("/item/")
-# async def create_item(item: Item):
-#     return [item.name, item.description, item.price, item.tax]
