@@ -84,6 +84,127 @@ def calculate_sensor_statistics(readings):
     }
 
 
+from typing import Any
+
+def sample_telemetry(
+    telemetry_records: list[Telemetry],
+    max_samples: int = 30,
+    event_samples_per_sensor: int = 2,
+) -> list[dict[str, Any]]:
+    """
+    Select representative telemetry samples and readings associated
+    with unusually high or low sensor values.
+
+    Args:
+        telemetry_records: Telemetry records ordered by timestamp.
+        max_samples: Target maximum number of samples.
+        event_samples_per_sensor: Number of lowest and highest readings
+            to consider for each numeric sensor.
+
+    Returns:
+        A chronological list of serialized telemetry samples.
+    """
+
+    if not telemetry_records:
+        return []
+
+    # Exclude database identifiers and relationship objects.
+    sensor_fields = [
+        "rpm",
+        "speed",
+        "coolant_temperature",
+        "intake_air_temperature",
+        "engine_load",
+        "throttle_position",
+        "mass_air_flow",
+        "map_pressure",
+        "fuel_level",
+        "fuel_pressure",
+        "timing_advance",
+        "control_module_voltage",
+        "short_trim",
+        "hybrid_battery_life",
+    ]
+
+    total_records = len(telemetry_records)
+
+    # Keep all readings if the session is already small enough.
+    if total_records <= max_samples:
+        selected_indices = set(range(total_records))
+    else:
+        selected_indices = set()
+
+        # 1. Select evenly distributed samples across the session.
+        evenly_spaced_count = max_samples
+
+        for i in range(evenly_spaced_count):
+            index = round(
+                i * (total_records - 1) / (evenly_spaced_count - 1)
+            )
+            selected_indices.add(index)
+
+    # 2. Select potentially important low/high readings.
+    # These are candidates for review, not automatic fault indicators.
+    for field in sensor_fields:
+        valid_records = []
+
+        for index, record in enumerate(telemetry_records):
+            value = getattr(record, field, None)
+
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                # Exclude NaN and infinity.
+                import math
+
+                if math.isfinite(value):
+                    valid_records.append((index, value))
+
+        if not valid_records:
+            continue
+
+        lowest = sorted(valid_records, key=lambda item: item[1])
+        highest = sorted(valid_records, key=lambda item: item[1], reverse=True)
+
+        for index, _ in lowest[:event_samples_per_sensor]:
+            selected_indices.add(index)
+
+        for index, _ in highest[:event_samples_per_sensor]:
+            selected_indices.add(index)
+
+    # 3. Serialize selected records chronologically.
+    sampled_records = []
+
+    for index in sorted(selected_indices):
+        record = telemetry_records[index]
+
+        sample = {
+            "timestamp": (
+                record.timestamp.isoformat()
+                if record.timestamp is not None
+                else None
+            ),
+        }
+
+        for field in sensor_fields:
+            value = getattr(record, field, None)
+
+            # Convert database numeric values to ordinary Python numbers.
+            # Preserve missing readings as null.
+            if value is None:
+                sample[field] = None
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                import math
+
+                sample[field] = (
+                    value if math.isfinite(value) else None
+                )
+            else:
+                sample[field] = value
+
+        sampled_records.append(sample)
+
+    return sampled_records
+
+
 
 def build_session_summary(
     db: Session,
@@ -129,6 +250,11 @@ def build_session_summary(
             "records were found for this session."
         )
 
+    telemetry_samples = sample_telemetry(
+    telemetry_records=telemetry_records,
+    max_samples=30,
+    event_samples_per_sensor=2,
+    )
     # 3. Calculate the session's time range.
     timestamps = [
         record.timestamp
@@ -340,5 +466,6 @@ def build_session_summary(
     summary.telemetry_summary = telemetry_summary
     summary.data_quality = data_quality
     summary.vehicle_id = telemetry_records[0].vehicle_id
+    summary.samples = telemetry_samples
     # The caller is responsible for committing the transaction.
     return summary

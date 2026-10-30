@@ -9,6 +9,8 @@ from pydantic import BaseModel
 from uuid import UUID
 from sqlalchemy.orm import Session
 
+from .services.aiprocess import analyze_vehicle_data
+
 from .services.summaryCalc import build_session_summary
 
 from .models.driving_session import DrivingSession
@@ -382,6 +384,7 @@ def create_session_summary(drivingSession, db: Session = Depends(get_db)):
             "total_samples": summary.total_samples,
             "telemetry_summary": summary.telemetry_summary,
             "data_quality": summary.data_quality,
+            "samples":summary.samples
         }
 
     except ValueError as exc:
@@ -389,6 +392,16 @@ def create_session_summary(drivingSession, db: Session = Depends(get_db)):
             status_code=404,
             detail=str(exc)
         )
+
+#AIProcess
+@app.get('/api/anaylze_session')
+def analyze_session(drivingSession, db: Session = Depends(get_db)):
+    session = create_session_summary(drivingSession,db)
+    return analyze_vehicle_data({
+    "make": "Ford",
+    "model": "C-Max",
+    "year": 2016,
+},session)
 
 # Signup endpoint
 @app.post("/api/signup")
