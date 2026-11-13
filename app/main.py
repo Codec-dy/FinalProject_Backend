@@ -18,6 +18,7 @@ from .models.user import User
 from .models.vehicle import Vehicle
 from .models.diagnostic import Diagnostics
 from .models.telemetry import Telemetry
+from .models.maintenance import Maintenance
 from .database.databaseConnection import engine, get_db
 from .routes.vehicle_visualization import router as vehicle_visualization_router
 
@@ -39,6 +40,17 @@ class Signup(BaseModel):
 class Login(BaseModel):
     email: str
     password: str
+
+class ChangePassword(BaseModel):
+    email: str
+    current_password: str
+    new_password: str
+
+class MaintenanceCreate(BaseModel):
+    vehicle_id: UUID
+    title: str
+    scheduled_date: datetime.date
+    notes: str | None = None
 
 class DiagnosticsInfo(BaseModel):
     vehicle_id: str
@@ -70,6 +82,20 @@ class TelemetryInfo(BaseModel):
     timestamp: datetime.datetime | None = None
 
 
+def _maintenance_payload(record: Maintenance) -> dict[str, Any]:
+    return {
+        "id": str(record.id),
+        "vehicle_id": str(record.vehicle_id),
+        "title": record.title,
+        "notes": record.notes,
+        "scheduled_date": record.scheduled_date.isoformat(),
+        "completed": record.completed,
+        "completed_at": record.completed_at.isoformat()
+        if record.completed_at
+        else None,
+    }
+
+
 try:
     connection = engine.connect()
     print("✅ PostgreSQL Connected Successfully!")
@@ -91,6 +117,12 @@ app.add_middleware(
 )
 
 app.include_router(vehicle_visualization_router)
+
+
+@app.on_event("startup")
+def create_maintenance_table() -> None:
+    Maintenance.__table__.create(bind=engine, checkfirst=True)
+
 
 @app.get("/api/raspberrypitest")
 async def raspberry_pi_test():
@@ -114,6 +146,23 @@ def login(login: Login, db: Session = Depends(get_db)):
         return {"message": "Login successful", "user_id": str(user.id), "userInfo": userInfo, "vehicleInfo": vehicleInfo, "diagnosticsInfo":diagnosticsInfo, "success": True}
     except Exception as e:
         raise e
+
+@app.put("/api/change-password")
+def change_password(change: ChangePassword, db: Session = Depends(get_db)):
+    if len(change.new_password) < 8:
+        return {"message": "New password must be at least 8 characters", "success": False}
+
+    user = db.query(User).filter(User.email == change.email).first()
+    if not user or user.password_hash != change.current_password:
+        return {"message": "Current password is incorrect", "success": False}
+
+    try:
+        user.password_hash = change.new_password
+        db.commit()
+        return {"message": "Password updated successfully", "success": True}
+    except Exception:
+        db.rollback()
+        raise
 
 @app.get('/api/userInfo')
 def get_user_info(user_id: str, db: Session = Depends(get_db)):
@@ -160,6 +209,97 @@ def get_vehicle_info(user_id: str, db: Session = Depends(get_db)):
         }
     except Exception as e:
         raise e
+
+
+@app.get("/api/maintenance")
+def get_maintenance(vehicle_id: UUID, db: Session = Depends(get_db)):
+    records = (
+        db.query(Maintenance)
+        .filter(Maintenance.vehicle_id == vehicle_id)
+        .order_by(Maintenance.scheduled_date.desc(), Maintenance.created_at.desc())
+        .all()
+    )
+    return {
+        "success": True,
+        "maintenance": [_maintenance_payload(record) for record in records],
+    }
+
+
+@app.post("/api/maintenance")
+def create_maintenance(
+    maintenance: MaintenanceCreate,
+    db: Session = Depends(get_db),
+):
+    title = maintenance.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Maintenance title is required")
+    if not db.query(Vehicle).filter(Vehicle.id == maintenance.vehicle_id).first():
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    record = Maintenance(
+        vehicle_id=maintenance.vehicle_id,
+        title=title,
+        notes=maintenance.notes.strip() if maintenance.notes else None,
+        scheduled_date=maintenance.scheduled_date,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return {
+        "success": True,
+        "message": "Maintenance scheduled",
+        "maintenance": _maintenance_payload(record),
+    }
+
+
+@app.put("/api/maintenance/{maintenance_id}/complete")
+def complete_maintenance(
+    maintenance_id: UUID,
+    vehicle_id: UUID,
+    db: Session = Depends(get_db),
+):
+    record = (
+        db.query(Maintenance)
+        .filter(
+            Maintenance.id == maintenance_id,
+            Maintenance.vehicle_id == vehicle_id,
+        )
+        .first()
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="Maintenance schedule not found")
+    if not record.completed:
+        record.completed = True
+        record.completed_at = datetime.datetime.now(datetime.timezone.utc)
+        db.commit()
+        db.refresh(record)
+    return {
+        "success": True,
+        "message": "Maintenance marked as complete",
+        "maintenance": _maintenance_payload(record),
+    }
+
+
+@app.delete("/api/maintenance/{maintenance_id}")
+def delete_maintenance(
+    maintenance_id: UUID,
+    vehicle_id: UUID,
+    db: Session = Depends(get_db),
+):
+    record = (
+        db.query(Maintenance)
+        .filter(
+            Maintenance.id == maintenance_id,
+            Maintenance.vehicle_id == vehicle_id,
+            Maintenance.completed.is_(False),
+        )
+        .first()
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="Scheduled maintenance not found")
+    db.delete(record)
+    db.commit()
+    return {"success": True, "message": "Maintenance schedule deleted"}
 
 @app.get("/api/diagnostics")
 def get_diagnostics_info(vehicle_id: str, db: Session = Depends(get_db)):

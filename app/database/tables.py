@@ -8,7 +8,7 @@ from ..models.driving_session import DrivingSession
 from ..models.telemetry import Telemetry
 from ..models.diagnostic import Diagnostics
 from ..models.session_summary import SessionSummary
-# from ..models.maintenance import Maintenance
+from ..models.maintenance import Maintenance
 # from ..models.ai_report import AIReport
 # from ..models.alert import Alert
 
