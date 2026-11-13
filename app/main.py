@@ -1,15 +1,20 @@
 import datetime
 import json
-from typing import Any
+import logging
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
-from pydantic import BaseModel
+from openai import APIError
+from pydantic import BaseModel, Field
 from uuid import UUID
 from sqlalchemy.orm import Session
 
-from .services.aiprocess import analyze_vehicle_data
+from .services.aiprocess import (
+    OPENAI_MODEL,
+    analyze_vehicle_data,
+    client as openai_client,
+)
 
 from .services.summaryCalc import build_session_summary
 
@@ -19,8 +24,11 @@ from .models.vehicle import Vehicle
 from .models.diagnostic import Diagnostics
 from .models.telemetry import Telemetry
 from .models.maintenance import Maintenance
+from .models.session_summary import SessionSummary
 from .database.databaseConnection import engine, get_db
 from .routes.vehicle_visualization import router as vehicle_visualization_router
+
+logger = logging.getLogger(__name__)
 
 
 class Signup(BaseModel):
@@ -51,6 +59,19 @@ class MaintenanceCreate(BaseModel):
     title: str
     scheduled_date: datetime.date
     notes: str | None = None
+
+class VehicleUpdate(BaseModel):
+    mileage: int = Field(ge=0)
+    fuel_type: str
+
+class ChatHistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=2000)
+
+class VehicleChatRequest(BaseModel):
+    vehicle_id: UUID
+    message: str = Field(min_length=1, max_length=2000)
+    history: list[ChatHistoryMessage] = Field(default_factory=list, max_length=12)
 
 class DiagnosticsInfo(BaseModel):
     vehicle_id: str
@@ -211,6 +232,45 @@ def get_vehicle_info(user_id: str, db: Session = Depends(get_db)):
         raise e
 
 
+@app.put("/api/vehicleInfo/{vehicle_id}")
+def update_vehicle_info(
+    vehicle_id: UUID,
+    update: VehicleUpdate,
+    db: Session = Depends(get_db),
+):
+    fuel_type = update.fuel_type.strip()
+    if not fuel_type:
+        raise HTTPException(status_code=400, detail="Fuel type is required")
+
+    vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    try:
+        vehicle.mileage = update.mileage
+        vehicle.fuel_type = fuel_type
+        db.commit()
+        db.refresh(vehicle)
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "success": True,
+        "message": "Vehicle details updated",
+        "vehicle": {
+            "id": str(vehicle.id),
+            "make": vehicle.make,
+            "model": vehicle.model,
+            "year": vehicle.year,
+            "engine": vehicle.engine,
+            "vin": vehicle.vin,
+            "mileage": vehicle.mileage,
+            "fuel_type": vehicle.fuel_type,
+        },
+    }
+
+
 @app.get("/api/maintenance")
 def get_maintenance(vehicle_id: UUID, db: Session = Depends(get_db)):
     records = (
@@ -300,6 +360,189 @@ def delete_maintenance(
     db.delete(record)
     db.commit()
     return {"success": True, "message": "Maintenance schedule deleted"}
+
+
+@app.post("/api/vehicle-chat")
+def vehicle_chat(
+    request: VehicleChatRequest,
+    db: Session = Depends(get_db),
+):
+    vehicle = db.query(Vehicle).filter(Vehicle.id == request.vehicle_id).first()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    maintenance_records = (
+        db.query(Maintenance)
+        .filter(Maintenance.vehicle_id == request.vehicle_id)
+        .order_by(Maintenance.scheduled_date.asc())
+        .limit(50)
+        .all()
+    )
+    diagnostic_records = (
+        db.query(Diagnostics)
+        .filter(Diagnostics.vehicle_id == request.vehicle_id)
+        .order_by(Diagnostics.detected_at.desc())
+        .limit(50)
+        .all()
+    )
+    completed_sessions = (
+        db.query(DrivingSession)
+        .filter(
+            DrivingSession.vehicle_id == request.vehicle_id,
+            DrivingSession.end_time.is_not(None),
+        )
+        .order_by(DrivingSession.end_time.desc())
+        .limit(10)
+        .all()
+    )
+    session_ids = [session.id for session in completed_sessions]
+    summaries = (
+        db.query(SessionSummary)
+        .filter(SessionSummary.driving_session_id.in_(session_ids))
+        .all()
+        if session_ids
+        else []
+    )
+    summary_by_session = {
+        str(summary.driving_session_id): summary for summary in summaries
+    }
+    latest_telemetry = (
+        db.query(Telemetry)
+        .filter(Telemetry.vehicle_id == request.vehicle_id)
+        .order_by(Telemetry.timestamp.desc())
+        .first()
+    )
+
+    vehicle_context = {
+        "vehicle": {
+            "year": vehicle.year,
+            "make": vehicle.make,
+            "model": vehicle.model,
+            "engine": vehicle.engine,
+            "fuel_type": vehicle.fuel_type,
+            "mileage": vehicle.mileage,
+        },
+        "maintenance": [
+            {
+                "title": item.title,
+                "notes": item.notes,
+                "scheduled_date": item.scheduled_date.isoformat(),
+                "completed": item.completed,
+                "completed_at": item.completed_at.isoformat()
+                if item.completed_at
+                else None,
+            }
+            for item in maintenance_records
+        ],
+        "diagnostic_codes": [
+            {
+                "code": item.code,
+                "title": item.title,
+                "description": item.description,
+                "severity": item.severity,
+                "causes": item.causes,
+                "recommended": item.recommended,
+                "detected_at": item.detected_at.isoformat()
+                if item.detected_at
+                else None,
+                "cleared_at": item.cleared_at.isoformat()
+                if item.cleared_at
+                else None,
+            }
+            for item in diagnostic_records
+        ],
+        "completed_trips": [
+            {
+                "start_time": session.start_time.isoformat()
+                if session.start_time
+                else None,
+                "end_time": session.end_time.isoformat()
+                if session.end_time
+                else None,
+                "summary": (
+                    {
+                        "duration_seconds": summary_by_session[
+                            str(session.id)
+                        ].duration_seconds,
+                        "distance": summary_by_session[str(session.id)].distance,
+                        "average_speed": summary_by_session[
+                            str(session.id)
+                        ].average_speed,
+                        "maximum_speed": summary_by_session[
+                            str(session.id)
+                        ].maximum_speed,
+                        "total_samples": summary_by_session[
+                            str(session.id)
+                        ].total_samples,
+                        "telemetry_summary": summary_by_session[
+                            str(session.id)
+                        ].telemetry_summary,
+                    }
+                    if str(session.id) in summary_by_session
+                    else None
+                ),
+            }
+            for session in completed_sessions
+        ],
+        "latest_telemetry": (
+            {
+                "timestamp": latest_telemetry.timestamp.isoformat()
+                if latest_telemetry.timestamp
+                else None,
+                "rpm": latest_telemetry.rpm,
+                "speed": latest_telemetry.speed,
+                "coolant_temperature": latest_telemetry.coolant_temperature,
+                "control_module_voltage": latest_telemetry.control_module_voltage,
+                "fuel_level": latest_telemetry.fuel_level,
+            }
+            if latest_telemetry
+            else None
+        ),
+    }
+
+    try:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            instructions=(
+                "You are DriveSense AI, a helpful vehicle information assistant. "
+                "Answer questions using the supplied vehicle data. Address "
+                "predictive maintenance, upcoming or completed maintenance, "
+                "completed trips, diagnostic trouble codes, and latest "
+                "telemetry when relevant. Treat diagnostic codes as recorded "
+                "evidence, not a definitive diagnosis. Never invent readings, "
+                "trips, codes, or maintenance records; state when data is "
+                "missing. For safety-critical or urgent symptoms, advise the "
+                "user to stop driving when appropriate and consult a qualified "
+                "mechanic. Keep answers clear and concise."
+            ),
+            input=json.dumps(
+                {
+                    "vehicle_data": vehicle_context,
+                    "recent_conversation": [
+                        message.model_dump() for message in request.history[-12:]
+                    ],
+                    "question": request.message.strip(),
+                },
+                default=str,
+            ),
+        )
+    except APIError as error:
+        logger.exception("Vehicle chat request to OpenAI failed")
+        raise HTTPException(
+            status_code=502,
+            detail="The vehicle assistant is temporarily unavailable.",
+        ) from error
+
+    output_text = response.output_text
+    answer = output_text.strip() if isinstance(output_text, str) else ""
+    if not answer:
+        logger.error("OpenAI returned an empty vehicle chat response")
+        raise HTTPException(
+            status_code=502,
+            detail="The vehicle assistant returned an empty response.",
+        )
+    return {"success": True, "answer": answer}
+
 
 @app.get("/api/diagnostics")
 def get_diagnostics_info(vehicle_id: str, db: Session = Depends(get_db)):
