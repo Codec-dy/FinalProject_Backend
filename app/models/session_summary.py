@@ -19,13 +19,7 @@ from app.database.base import Base
 class SessionSummary(Base):
     __tablename__ = "session_summaries"
 
-    __table_args__ = (
-        UniqueConstraint(
-            "driving_session_id",
-            name="uq_session_summaries_driving_session_id",
-        ),
-    )
-
+  
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,

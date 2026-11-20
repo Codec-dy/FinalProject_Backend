@@ -25,6 +25,11 @@ from .models.diagnostic import Diagnostics
 from .models.telemetry import Telemetry
 from .models.maintenance import Maintenance
 from .models.session_summary import SessionSummary
+from .models.vehicle_health_assessment import (
+    SystemHealthAssessment,
+    VehicleHealthAssessment,
+    VehicleHealthFinding,
+)
 from .database.databaseConnection import engine, get_db
 from .routes.vehicle_visualization import router as vehicle_visualization_router
 
@@ -141,8 +146,11 @@ app.include_router(vehicle_visualization_router)
 
 
 @app.on_event("startup")
-def create_maintenance_table() -> None:
+def create_additional_tables() -> None:
     Maintenance.__table__.create(bind=engine, checkfirst=True)
+    VehicleHealthAssessment.__table__.create(bind=engine, checkfirst=True)
+    SystemHealthAssessment.__table__.create(bind=engine, checkfirst=True)
+    VehicleHealthFinding.__table__.create(bind=engine, checkfirst=True)
 
 
 @app.get("/api/raspberrypitest")
@@ -755,7 +763,8 @@ def create_session_summary(drivingSession, db: Session = Depends(get_db)):
             driving_session_id=drivingSession
         )
 
-        return {
+
+        summary_data = {
             "id": str(summary.id),
             "driving_session_id": str(summary.driving_session_id),
             "vehicle_id":str(summary.vehicle_id),
@@ -769,6 +778,45 @@ def create_session_summary(drivingSession, db: Session = Depends(get_db)):
             "data_quality": summary.data_quality,
             "samples":summary.samples
         }
+        existing_summary = db.query(SessionSummary).filter(
+        SessionSummary.driving_session_id == summary_data["driving_session_id"]
+    ).first()
+
+        if existing_summary:
+            # Update existing summary
+            existing_summary.vehicle_id = summary_data["vehicle_id"]
+            existing_summary.duration_seconds = summary_data["duration_seconds"]
+            existing_summary.distance = summary_data["distance"]
+            existing_summary.average_speed = summary_data["average_speed"]
+            existing_summary.average_moving_speed = summary_data["average_moving_speed"]
+            existing_summary.maximum_speed = summary_data["maximum_speed"]
+            existing_summary.total_samples = summary_data["total_samples"]
+            existing_summary.telemetry_summary = summary_data["telemetry_summary"]
+            existing_summary.data_quality = summary_data["data_quality"]
+
+            summary = existing_summary
+
+        else:
+            # Create a new summary
+            summary = SessionSummary(
+                driving_session_id=summary_data["driving_session_id"],
+                vehicle_id=summary_data["vehicle_id"],
+                duration_seconds=summary_data["duration_seconds"],
+                distance=summary_data["distance"],
+                average_speed=summary_data["average_speed"],
+                average_moving_speed=summary_data["average_moving_speed"],
+                maximum_speed=summary_data["maximum_speed"],
+                total_samples=summary_data["total_samples"],
+                telemetry_summary=summary_data["telemetry_summary"],
+                data_quality=summary_data["data_quality"],
+            )
+
+            db.add(summary)
+
+        db.commit()
+        db.refresh(summary)
+        return summary_data
+
 
     except ValueError as exc:
         raise HTTPException(
@@ -777,14 +825,94 @@ def create_session_summary(drivingSession, db: Session = Depends(get_db)):
         )
 
 #AIProcess
-@app.get('/api/anaylze_session')
-def analyze_session(drivingSession, db: Session = Depends(get_db)):
-    session = create_session_summary(drivingSession,db)
-    return analyze_vehicle_data({
-    "make": "Ford",
-    "model": "C-Max",
-    "year": 2016,
+@app.get('/api/analyze_session')
+def analyze_session(drivingSession=None, db: Session = Depends(get_db)):
+    if drivingSession is not None:
+        
+        session = create_session_summary(drivingSession,db)
+    else:
+        #get the last driving session
+        last_session = db.query(DrivingSession).filter(DrivingSession.end_time.is_not(None)).order_by(DrivingSession.end_time.desc()).first()
+        if not last_session:
+            raise HTTPException(status_code=404, detail="No completed driving session found")
+        
+        session = create_session_summary(last_session.id,db)
+
+    vehicle = db.query(Vehicle).filter(Vehicle.id ==session["vehicle_id"]).first()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    
+    analysis = analyze_vehicle_data({
+    "make": vehicle.make,
+    "model": vehicle.model,
+    "year": vehicle.year,
 },session)
+    try:
+        # 4. Save overall health assessment
+        assessment = VehicleHealthAssessment(
+            vehicle_id=vehicle.id,
+            driving_session_id=drivingSession,
+            overall_status=analysis.overall_status,
+            overall_summary=analysis.overall_summary,
+            data_quality=analysis.data_quality.quality,
+            missing_value_percentage=(
+                analysis.data_quality.missing_value_percentage
+            ),
+            analysis_model="OpenAI",
+            analysis_version="1.0",
+        )
+
+        db.add(assessment)
+        db.flush()
+
+        # 5. Save the five system assessments
+        system_results = [
+            analysis.engine_health,
+            analysis.transmission_health,
+            analysis.brake_system_health,
+            analysis.battery_12v_health,
+            analysis.coolant_system_health,
+        ]
+
+        for system in system_results:
+
+            system_record = SystemHealthAssessment(
+                assessment_id=assessment.id,
+                system=system.system,
+                status=system.status,
+                summary=system.summary,
+                supporting_evidence=system.supporting_evidence,
+                limitations=system.limitations,
+            )
+
+            db.add(system_record)
+            db.flush()
+
+            # 6. Save findings for this system
+            for finding in system.findings:
+
+                finding_record = VehicleHealthFinding(
+                    system_assessment_id=system_record.id,
+                    category=finding.category,
+                    title=finding.title,
+                    observed_evidence=finding.observed_evidence,
+                    interpretation=finding.interpretation,
+                    severity=finding.severity,
+                    confidence=finding.confidence,
+                    recommended_actions=finding.recommended_actions,
+                )
+
+                db.add(finding_record)
+
+        # 7. Commit all records
+        db.commit()
+
+        # 8. Return the original AI analysis
+        return analysis
+
+    except Exception:
+        db.rollback()
+        raise
 
 # Signup endpoint
 @app.post("/api/signup")

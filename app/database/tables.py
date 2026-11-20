@@ -9,6 +9,11 @@ from ..models.telemetry import Telemetry
 from ..models.diagnostic import Diagnostics
 from ..models.session_summary import SessionSummary
 from ..models.maintenance import Maintenance
+from ..models.vehicle_health_assessment import (
+    SystemHealthAssessment,
+    VehicleHealthAssessment,
+    VehicleHealthFinding,
+)
 # from ..models.ai_report import AIReport
 # from ..models.alert import Alert
 

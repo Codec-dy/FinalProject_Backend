@@ -38,3 +38,8 @@ class DrivingSession(Base):
     telemetry: Mapped[list["Telemetry"]] = relationship(
         "Telemetry", back_populates="driving_session"
     )
+
+    health_assessments: Mapped[list["VehicleHealthAssessment"]] = relationship(
+        back_populates="driving_session",
+        cascade="all, delete-orphan",
+    )
